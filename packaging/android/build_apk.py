@@ -286,6 +286,16 @@ def build_adrenotools(ndk, out, abi=ABI):
     return libraries
 
 
+def openxr_loader(abi=ABI):
+    """The Khronos OpenXR loader (openxr/ beside this script, from the OpenXR-SDK AAR):
+    the openxr crate dlopens it by name at runtime, so it goes in the APK as a library
+    like the launchers (extractNativeLibs puts it in the app's library folder).
+    arm64-v8a only, as the game."""
+    if abi != "arm64-v8a":
+        return {}
+    return {"libopenxr_loader.so": HERE / "openxr" / "libopenxr_loader.so"}
+
+
 def zip_folder(folder, archive):
     """`folder`'s files in the zip `archive`, all dated alike: the same files make the same zip,
     which the app tells from the next by its bytes."""
@@ -567,6 +577,8 @@ def main():
     libraries = build_launchers(ndk, out, args.abi)
     # Custom GPU drivers (libadrenotools): arm64-v8a only, beside the launchers.
     libraries.update(build_adrenotools(ndk, out, args.abi))
+    # The OpenXR loader, for the Stage 2 smoke test (xr_smoke.rs): beside them.
+    libraries.update(openxr_loader(args.abi))
     libraries[library.name] = library
     libraries.update(rust_dylibs(ndk, built, out))
     if rust_dylib_build():
