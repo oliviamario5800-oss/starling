@@ -100,6 +100,28 @@ mod imp {
         pub format: u32,
         pub begun: bool,
         pub state: openxr::SessionState,
+        /// Wrapped swapchain images, per eye per image index, created on
+        /// first acquire and reused for the session's lifetime.
+        pub textures: [Vec<Option<wgpu::Texture>>; 2],
+    }
+
+    /// One eye's render target for a begun frame.
+    pub struct XrEyeTarget {
+        pub texture: wgpu::Texture,
+        pub view: openxr::View,
+        pub image_index: u32,
+    }
+
+    /// A begun XR frame. `active` is false when the session has not
+    /// begun yet: nothing was waited on and [`XrContext::end_frame`]
+    /// must not be called for it (it is a no-op if it is).
+    pub struct XrFrame {
+        pub active: bool,
+        pub should_render: bool,
+        pub views_valid: bool,
+        pub display_time: openxr::Time,
+        pub eyes: Vec<XrEyeTarget>,
+        pub extent: openxr::Extent2Di,
     }
 
     pub static CTX: Mutex<Option<XrContext>> = Mutex::new(None);
@@ -442,6 +464,10 @@ mod imp {
             view_config[1].recommended_image_rect_width,
             view_config[1].recommended_image_rect_height,
         );
+        let textures = [
+            vec![None; swapchain_images[0].len()],
+            vec![None; swapchain_images[1].len()],
+        ];
         *CTX.lock().unwrap_or_else(|error| error.into_inner()) = Some(XrContext {
             instance: xr_instance,
             session,
@@ -454,6 +480,7 @@ mod imp {
             format,
             begun: false,
             state: openxr::SessionState::UNKNOWN,
+            textures,
         });
         Ok(Boot {
             instance: wgpu_instance,
@@ -487,9 +514,241 @@ mod imp {
             formats.len()
         ))
     }
+
+    impl XrContext {
+        /// Drain pending session events, beginning the session when the
+        /// runtime offers it. Returns whether the session is begun.
+        pub fn poll_events(&mut self) -> StageResult<bool> {
+            // A fresh buffer per drain: EventDataBuffer is not Send, so
+            // it cannot live in the shared context.
+            let mut event_buffer = openxr::EventDataBuffer::new();
+            loop {
+                match self.instance.poll_event(&mut event_buffer) {
+                    Ok(Some(openxr::Event::SessionStateChanged(changed))) => {
+                        self.state = changed.state();
+                        log::info!("XR_FRAME: state {:?}", self.state);
+                        match self.state {
+                            openxr::SessionState::READY => {
+                                stage(
+                                    "begin session",
+                                    self.session.begin(
+                                        openxr::ViewConfigurationType::PRIMARY_STEREO,
+                                    ),
+                                )?;
+                                self.begun = true;
+                            }
+                            openxr::SessionState::STOPPING => {
+                                let _ = self.session.end();
+                                self.begun = false;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(error) => {
+                        log::warn!("XR_FRAME: poll event failed (continuing): {error}");
+                        break;
+                    }
+                }
+            }
+            Ok(self.begun)
+        }
+
+        /// Wait for the next frame, begin it, locate the eye views and
+        /// acquire both swapchain images, wrapped as wgpu textures. A
+        /// frame that should not render (or whose poses are invalid)
+        /// comes back with `should_render` false and no eyes; end it
+        /// with [`Self::end_frame`] all the same.
+        pub fn begin_frame(
+            &mut self,
+            device: &wgpu::Device,
+            wgpu_format: wgpu::TextureFormat,
+        ) -> StageResult<XrFrame> {
+            let extent = openxr::Extent2Di {
+                width: self.views[0].recommended_image_rect_width as i32,
+                height: self.views[0].recommended_image_rect_height as i32,
+            };
+            let skip = XrFrame {
+                active: false,
+                should_render: false,
+                views_valid: false,
+                display_time: openxr::Time::from_nanos(0),
+                eyes: Vec::new(),
+                extent,
+            };
+            if !self.poll_events()? {
+                return Ok(skip);
+            }
+            let frame_state = stage("wait frame", self.frame_waiter.wait())?;
+            stage("begin frame", self.frame_stream.begin())?;
+            let mut frame = XrFrame {
+                active: true,
+                ..skip
+            };
+            frame.display_time = frame_state.predicted_display_time;
+            if !frame_state.should_render {
+                return Ok(frame);
+            }
+            let (flags, views) = stage(
+                "locate views",
+                self.session.locate_views(
+                    openxr::ViewConfigurationType::PRIMARY_STEREO,
+                    frame_state.predicted_display_time,
+                    &self.space,
+                ),
+            )?;
+            frame.views_valid = flags.contains(openxr::ViewStateFlags::POSITION_VALID)
+                && flags.contains(openxr::ViewStateFlags::ORIENTATION_VALID);
+            if !frame.views_valid || views.len() < 2 {
+                return Ok(frame);
+            }
+            frame.should_render = true;
+            for (eye, view) in views.iter().take(2).enumerate() {
+                let index = stage("acquire image", self.swapchains[eye].acquire_image())?;
+                stage(
+                    "wait image",
+                    self.swapchains[eye].wait_image(openxr::Duration::INFINITE),
+                )?;
+                if self.textures[eye][index as usize].is_none() {
+                    let texture = wrap_swapchain_image(
+                        device,
+                        self.images[eye][index as usize],
+                        wgpu_format,
+                        extent,
+                    )?;
+                    self.textures[eye][index as usize] = Some(texture);
+                }
+                let texture = self.textures[eye][index as usize]
+                    .as_ref()
+                    .expect("just wrapped")
+                    .clone();
+                frame.eyes.push(XrEyeTarget {
+                    texture,
+                    view: *view,
+                    image_index: index,
+                });
+            }
+            Ok(frame)
+        }
+
+        /// Release the frame's images and submit it to the compositor.
+        /// Call only after the device's submissions for the frame have
+        /// completed. End-frame errors are logged, never fatal (a pose
+        /// can go invalid mid-frame; the next frame recovers).
+        pub fn end_frame(&mut self, frame: XrFrame) {
+            if !frame.active {
+                return;
+            }
+            for (eye, _) in frame.eyes.iter().enumerate() {
+                if let Err(error) = self.swapchains[eye].release_image() {
+                    log::warn!("XR_FRAME: release image {eye} failed (continuing): {error}");
+                }
+            }
+            let result = if frame.should_render && frame.views_valid && frame.eyes.len() == 2 {
+                let proj_views: Vec<openxr::CompositionLayerProjectionView<'_, XrVulkan>> = frame
+                    .eyes
+                    .iter()
+                    .enumerate()
+                    .map(|(eye, target)| {
+                        openxr::CompositionLayerProjectionView::new()
+                            .pose(target.view.pose)
+                            .fov(target.view.fov)
+                            .sub_image(
+                                openxr::SwapchainSubImage::new()
+                                    .swapchain(&self.swapchains[eye])
+                                    .image_rect(openxr::Rect2Di {
+                                        offset: openxr::Offset2Di { x: 0, y: 0 },
+                                        extent: frame.extent,
+                                    }),
+                            )
+                    })
+                    .collect();
+                let layer = openxr::CompositionLayerProjection::new()
+                    .space(&self.space)
+                    .views(&proj_views);
+                self.frame_stream.end(
+                    frame.display_time,
+                    openxr::EnvironmentBlendMode::OPAQUE,
+                    &[&layer],
+                )
+            } else {
+                self.frame_stream.end(
+                    frame.display_time,
+                    openxr::EnvironmentBlendMode::OPAQUE,
+                    &[],
+                )
+            };
+            if let Err(error) = result {
+                log::warn!("XR_FRAME: end frame failed (continuing): {error}");
+            }
+        }
+    }
+
+    /// Wrap one swapchain `VkImage` as a wgpu texture wgpu does not own:
+    /// with external memory and a no-op drop callback it destroys
+    /// neither the image nor its memory.
+    fn wrap_swapchain_image(
+        device: &wgpu::Device,
+        vk_image: u64,
+        format: wgpu::TextureFormat,
+        extent: openxr::Extent2Di,
+    ) -> StageResult<wgpu::Texture> {
+        use ash::vk::Handle as _;
+        let size = wgpu::Extent3d {
+            width: extent.width as u32,
+            height: extent.height as u32,
+            depth_or_array_layers: 1,
+        };
+        // SAFETY: the device wraps the hal device the session was
+        // created on (the bootstrap built both from the same handles).
+        let hal_device = unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }
+            .ok_or("hal device: none")?;
+        let hal_desc = wgpu::hal::TextureDescriptor {
+            label: Some("XR eye"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUses::COLOR_TARGET,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: Vec::new(),
+        };
+        // SAFETY: the image belongs to this session's swapchain, is
+        // acquired and waited on, and outlives the returned texture
+        // (textures are cached for the session's lifetime).
+        let hal_texture = unsafe {
+            hal_device.texture_from_raw(
+                ash::vk::Image::from_raw(vk_image),
+                &hal_desc,
+                Some(Box::new(|| {})),
+                wgpu::hal::vulkan::TextureMemory::External,
+            )
+        };
+        // SAFETY: the hal texture was just made from this device with a
+        // matching descriptor; the image starts undefined to wgpu.
+        let texture = unsafe {
+            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("XR eye"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                },
+                wgpu::TextureUses::UNINITIALIZED,
+            )
+        };
+        Ok(texture)
+    }
 }
 
 /// The live XR context for the frame driver (Android only; the render
 /// loop's XR bracketing locks it once per frame).
 #[cfg(target_os = "android")]
-pub use imp::{CTX, XrContext};
+pub use imp::{CTX, XrContext, XrEyeTarget, XrFrame};
