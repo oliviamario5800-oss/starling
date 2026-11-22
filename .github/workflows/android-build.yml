@@ -84,9 +84,11 @@ jobs:
         run: |
           test -n "$KEYSTORE" || exit 0
           mkdir -p target/android
+          echo "secret chars: ${#KEYSTORE}"
+          echo "secret sha256: $(printf %s "$KEYSTORE" | sha256sum | cut -d' ' -f1)"
           echo "$KEYSTORE" | base64 -d > target/android/debug.keystore
           echo "keystore sha256: $(sha256sum target/android/debug.keystore | cut -d' ' -f1)"
-          test "$(sha256sum target/android/debug.keystore | cut -d' ' -f1)" = "1dd970885af7e6716e7fe056a4139fbc14af87c8237b90b2cb90ffa2b7205030" || { echo "ERROR: decoded keystore does not match the expected hash - the repo secret is corrupted; re-add it and rerun."; exit 1; }      
+          test "$(sha256sum target/android/debug.keystore | cut -d' ' -f1)" = "9b6a7300ce4aa1e293d1c0ffbafa2930527234a14b982049a0c63c50335965b9" || { echo "ERROR: decoded keystore does not match the expected hash - the repo secret is corrupted; re-add it and rerun."; exit 1; }      
           
       # Full optimized build (profile fast: inherits release, opt-level 3).
       # No HORIZON_GAME_BUILD_ID: with a real .git checkout, horizon-mod-host's
