@@ -1842,6 +1842,7 @@ name = "horizon-client"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "ash",
  "bytemuck",
  "cap-fs-ext",
  "cap-std",
