@@ -92,6 +92,10 @@ jobs:
         run: python3 packaging/android/build_apk.py --profile fast
       - name: Repackage the same library as Starling Dev
         run: python3 packaging/android/build_apk.py --profile fast --dev --no-build
+      - name: Print the APK signer certificate
+        run: |
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs target/android/starling-dev-0.9.0-arm64-v8a.apk | grep -i 'SHA-256'
       - uses: actions/upload-artifact@v4
         with:
           name: starling-apks-arm64-v8a
