@@ -474,6 +474,7 @@ mod screenshot_readback;
 mod solid_paths;
 mod stars;
 mod surface_setup;
+pub mod xr_boot;
 use surface_setup::{AdapterChoice, AdapterFailure, open_adapter, pick_adapter, set_up_surface};
 mod off_page;
 use off_page::move_off_page;
@@ -2990,6 +2991,9 @@ impl Renderer {
             && (boot.is_some()
                 || previous
                     .is_some_and(|p| p.suspended && p.surface.is_none() && p.offscreen.is_none()));
+        // The VR spike's eye configuration, when the device below is the
+        // OpenXR one (`xr_boot`): the fabricated configuration adopts it.
+        let mut xr_eye = None;
         let Opened {
             instance,
             surface,
@@ -3030,10 +3034,20 @@ impl Renderer {
                         configured: None,
                     }
                 }
-                None => {
-                    let _step = crate::spans::startup::step("renderer.open_device");
-                    open_device(&window, offscreen, api, layers).await?
-                }
+                None => match xr_boot::take_opened() {
+                    // The VR spike's device: OpenXR owns the Vulkan device
+                    // and wgpu wraps it (`xr_boot`). Surfaceless; the frame
+                    // configuration adopts the eye's size and format below.
+                    Some((opened, eye)) => {
+                        describe_adapter(&opened.adapter);
+                        xr_eye = Some(eye);
+                        opened
+                    }
+                    None => {
+                        let _step = crate::spans::startup::step("renderer.open_device");
+                        open_device(&window, offscreen, api, layers).await?
+                    }
+                },
             },
         };
         // Computed once: the sprite arrays, the shaders' constants and the
@@ -3070,7 +3084,7 @@ impl Renderer {
             startup_step(format_args!("clearing the window"));
             clear_surface(&device, &queue, surface, config.format);
         }
-        let (config, present_modes, hdr_output) = if let Some((config, caps)) = configured {
+        let (mut config, present_modes, hdr_output) = if let Some((config, caps)) = configured {
             let hdr_output = hdr::output(&caps);
             if previous.is_none() {
                 log::info!(
@@ -3113,6 +3127,14 @@ impl Renderer {
             }
             (config, Vec::new(), hdr_output)
         };
+        // The VR spike draws into the headset's swapchain images, whose
+        // size and format the fabricated configuration adopts.
+        if let Some((eye_width, eye_height, eye_format)) = xr_eye {
+            config.width = eye_width.clamp(1, max_side);
+            config.height = eye_height.clamp(1, max_side);
+            config.format = eye_format;
+            config.view_formats = vec![eye_format];
+        }
         let offscreen = (surface.is_none() && !waits_for_window)
             .then(|| Self::offscreen_target(&device, &config));
         let wide_ok = draws_wide_frame(
