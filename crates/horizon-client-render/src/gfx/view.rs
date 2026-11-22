@@ -59,6 +59,17 @@ impl ViewSet {
         }
     }
 
+    /// A frame drawn from two views (a headset's eyes), culled with `cull`,
+    /// whose frustum must cover both. The first view is the primary: the
+    /// HUD, hand and screen-space effects follow it.
+    pub fn pair(left: View, right: View, cull: View) -> Self {
+        Self {
+            views: [left, right],
+            len: 2,
+            cull,
+        }
+    }
+
     /// The view the HUD, hand and screen-space effects follow.
     pub fn primary(&self) -> &View {
         &self.views[0]
@@ -167,5 +178,16 @@ mod tests {
         assert_eq!(set.views(), &[view]);
         assert_eq!(*set.primary(), view);
         assert_eq!(*set.cull(), view);
+    }
+
+    #[test]
+    fn a_pair_view_set_draws_both_views_and_culls_with_the_given_view() {
+        let left = View::screen(45.0, 10.0, 70.0, 1.0, 512.0);
+        let right = View::screen(44.0, 10.0, 70.0, 1.0, 512.0);
+        let cull = View::screen(44.5, 10.0, 90.0, 1.0, 512.0);
+        let set = ViewSet::pair(left, right, cull);
+        assert_eq!(set.views(), &[left, right]);
+        assert_eq!(*set.primary(), left);
+        assert_eq!(*set.cull(), cull);
     }
 }
