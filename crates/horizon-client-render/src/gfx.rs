@@ -1252,6 +1252,9 @@ pub struct Renderer {
     spare_surface: std::sync::Mutex<Option<wgpu::Surface<'static>>>,
     /// The offscreen colour target, sized like `config`.
     offscreen: Option<wgpu::Texture>,
+    /// The views the next `draw_frame` uses instead of the screen's (the
+    /// VR spike's per-eye draws set this for one call at a time).
+    view_override: Option<ViewSet>,
     /// Offscreen submissions still on the GPU: at most two frames run ahead.
     in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
     /// Splitscreen: the caller waits for the GPU once every player has submitted
@@ -5386,6 +5389,7 @@ impl Renderer {
             surface: surface.map(Arc::new),
             spare_surface: std::sync::Mutex::new(None),
             offscreen,
+            view_override: None,
             in_flight: std::collections::VecDeque::new(),
             paced_elsewhere: false,
             first_frame: if previous.is_none() {
@@ -8146,6 +8150,9 @@ impl Renderer {
     }
     /// The views `render` draws `frame` from.
     pub fn views(&self, frame: &Frame) -> ViewSet {
+        if let Some(views) = self.view_override {
+            return views;
+        }
         ViewSet::single(self.screen_view(
             frame.fov_degrees,
             frame.yaw,
@@ -8339,7 +8346,10 @@ impl Renderer {
         let scaled = self.screenshot_size();
         let rendered = match scaled {
             Some(size) => self.draw_scaled_frame(frame, size),
-            None => self.draw_frame(frame, None, self.output),
+            None => match self.draw_xr_frame(frame) {
+                Some(rendered) => rendered,
+                None => self.draw_frame(frame, None, self.output),
+            },
         };
         self.finish_prepared_frame();
         // A frame that was not drawn still submits the section copies and
