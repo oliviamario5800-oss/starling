@@ -105,6 +105,10 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+                <!-- Stage 2 spike step 3a: without the VR category the Quest shell
+                     launches the app as a 2D panel and the OpenXR session is never
+                     promoted past IDLE (observed on-device 2026-11-22). -->
+                <category android:name="com.oculus.intent.category.VR" />
             </intent-filter>
         </activity-alias>
         <activity
