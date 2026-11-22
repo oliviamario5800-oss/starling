@@ -40,15 +40,15 @@ fn probe() -> Result<(String, String), Box<dyn std::error::Error>> {
     // SAFETY: NativeActivity's VM and activity, alive as long as the process; the activity is
     // a global reference (the same handles android.rs's `with_activity` uses). The loader only
     // reads them while initialising and creating the instance, both inside this call.
-    let platform_info = openxr::AndroidPlatformInfo::new(
-        app.vm_as_ptr(),
-        app.activity_as_ptr(),
-    );
+    let platform_info = unsafe {
+        openxr::AndroidPlatformInfo::new(app.vm_as_ptr(), app.activity_as_ptr())
+    };
     // `loaded`: the loader is dlopen'd, not linked. On Android `Entry::load` resolves
     // "libopenxr_loader.so" from the app's library folder, where build_apk.py put it; every
     // Entry constructor runs the Android loader initialisation
     // (xrInitializeLoaderKHR with the VM and activity above) itself.
-    let entry = openxr::Entry::load(platform_info)?;
+    // SAFETY: the packaged loader is the Khronos OpenXR loader, built to the specification.
+    let entry = unsafe { openxr::Entry::load(&platform_info)? };
     let mut extensions = openxr::ExtensionSet::default();
     // Required to create an instance on Android at all; vulkan_enable2 is the session
     // extension step 3 will use, enabled now so its absence shows up in this step's log.
@@ -60,12 +60,13 @@ fn probe() -> Result<(String, String), Box<dyn std::error::Error>> {
             application_version: 0,
             engine_name: "Starling XR smoke",
             engine_version: 0,
+            api_version: openxr::Version::new(1, 0, 0),
         },
         &extensions,
-        None,
-        platform_info,
+        &[],
+        &platform_info,
     )?;
-    let runtime = instance.runtime_properties()?.runtime_name;
+    let runtime = instance.properties()?.runtime_name;
     let system = instance.system(openxr::FormFactor::HEAD_MOUNTED_DISPLAY)?;
     let system_name = instance.system_properties(system)?.system_name;
     // `instance` drops here: the probe keeps nothing.
