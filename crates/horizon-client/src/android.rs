@@ -1617,8 +1617,13 @@ pub fn main(
     // One log line either way; the game continues unchanged.
     crate::xr_smoke::run_once();
     // Stage 2 spike step 3a: an OpenXR session clearing the two eyes to different
-    // colours, on its own thread (xr_session.rs). The flat game is untouched.
-    crate::xr_session::start_once();
+    // colours, on its own thread (xr_session.rs). Superseded by step 3b: the
+    // session now belongs to the renderer's device bootstrap, so the 3a
+    // thread no longer starts (two sessions would fight over the runtime).
+    // Stage 2 spike step 3b: hand the platform pointers to the renderer's
+    // XR bootstrap (`gfx/xr_boot.rs`); the first Renderer::new runs it.
+    let app = android_app();
+    horizon_client_render::gfx::xr_boot::init(app.vm_as_ptr(), app.activity_as_ptr());
     if !in_game {
         // The launcher's log is its own, so the game's last one stays for the diagnostics.
         logging::init(&private.join("launcher"), "Launcher");

@@ -347,17 +347,20 @@ fn run() -> StageResult<String> {
         let frame_state = stage("wait frame", frame_waiter.wait())?;
         stage("begin frame", frame_stream.begin())?;
         if !frame_state.should_render {
-            stage(
-                "end frame (no render)",
-                frame_stream.end(
-                    frame_state.predicted_display_time,
-                    openxr::EnvironmentBlendMode::OPAQUE,
-                    &[],
-                ),
-            )?;
+            // An end() error must not kill the loop (see the pose note
+            // below); log it and move on to the next frame.
+            if let Err(error) = frame_stream.end(
+                frame_state.predicted_display_time,
+                openxr::EnvironmentBlendMode::OPAQUE,
+                &[],
+            ) {
+                log_info(&format!(
+                    "XR_SESSION: end frame failed (continuing): {error}"
+                ));
+            }
             continue;
         }
-        let (_view_flags, views) = stage(
+        let (view_flags, views) = stage(
             "locate views",
             session.locate_views(
                 openxr::ViewConfigurationType::PRIMARY_STEREO,
@@ -366,14 +369,35 @@ fn run() -> StageResult<String> {
             ),
         )?;
         if views.len() < 2 {
-            stage(
-                "end frame (views)",
-                frame_stream.end(
-                    frame_state.predicted_display_time,
-                    openxr::EnvironmentBlendMode::OPAQUE,
-                    &[],
-                ),
-            )?;
+            if let Err(error) = frame_stream.end(
+                frame_state.predicted_display_time,
+                openxr::EnvironmentBlendMode::OPAQUE,
+                &[],
+            ) {
+                log_info(&format!(
+                    "XR_SESSION: end frame failed (continuing): {error}"
+                ));
+            }
+            continue;
+        }
+        // When tracking drops for a frame, the view state flags lose the
+        // valid bits and the crate substitutes default (zeroed) pose parts;
+        // a zero quaternion is rejected by xrEndFrame with
+        // XR_ERROR_POSE_INVALID (observed on-device at frame ~2160 of the
+        // first 3a run, where it ended the loop). Submit an empty frame
+        // instead of the projection layer.
+        if !view_flags.contains(openxr::ViewStateFlags::POSITION_VALID)
+            || !view_flags.contains(openxr::ViewStateFlags::ORIENTATION_VALID)
+        {
+            if let Err(error) = frame_stream.end(
+                frame_state.predicted_display_time,
+                openxr::EnvironmentBlendMode::OPAQUE,
+                &[],
+            ) {
+                log_info(&format!(
+                    "XR_SESSION: end frame failed (continuing): {error}"
+                ));
+            }
             continue;
         }
 
@@ -499,14 +523,15 @@ fn run() -> StageResult<String> {
         let layer = openxr::CompositionLayerProjection::new()
             .space(&space)
             .views(&projection_views);
-        stage(
-            "end frame",
-            frame_stream.end(
-                frame_state.predicted_display_time,
-                openxr::EnvironmentBlendMode::OPAQUE,
-                &[&layer],
-            ),
-        )?;
+        if let Err(error) = frame_stream.end(
+            frame_state.predicted_display_time,
+            openxr::EnvironmentBlendMode::OPAQUE,
+            &[&layer],
+        ) {
+            log_info(&format!(
+                "XR_SESSION: end frame failed (continuing): {error}"
+            ));
+        }
         frames += 1;
         if frames % 120 == 0 {
             log_info(&format!(
@@ -537,8 +562,12 @@ fn split_extensions(list: &str) -> Vec<CString> {
 /// (The format type is a private alias in the `openxr` crate, so this works
 /// on the enumerated values by inference rather than naming the type.)
 fn pick_format<T: Copy + PartialEq<u32>>(formats: &[T]) -> T {
-    // VK_FORMAT_R8G8B8A8_SRGB = 44, VK_FORMAT_B8G8R8A8_SRGB = 50.
-    for preferred in [44u32, 50] {
+    // VkFormat values (ash::vk::Format): R8G8B8A8_SRGB = 43,
+    // R8G8B8A8_UNORM = 37, B8G8R8A8_SRGB = 50, B8G8R8A8_UNORM = 44. The
+    // first 3a run fell back to the runtime's first offer, 22
+    // (R8G8_SRGB — a two-channel format), because 44/50 were not offered;
+    // the clear still displayed correctly, but 3b needs a real RGBA format.
+    for preferred in [43u32, 37, 50, 44] {
         if let Some(found) = formats.iter().find(|format| **format == preferred) {
             return *found;
         }
