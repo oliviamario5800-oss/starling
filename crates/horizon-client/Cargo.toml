@@ -112,6 +112,10 @@ rustix = { version = "1", default-features = false, features = ["std", "time", "
 # file manager, the file picker, the clipboard (cpal's version of jni).
 winit = { version = "0.30.13", features = ["android-native-activity"] }
 jni = "0.21.1"
+# Stage 2 spike step 2: the OpenXR loader smoke test (src/xr_smoke.rs). The `loaded` feature
+# dlopens the bundled libopenxr_loader.so at runtime; nothing links against OpenXR, and the
+# dependency is Android-only, so no other target's build changes.
+openxr = { version = "=0.22.0", features = ["loaded"] }
 # The mods, resource packs and shader packs catalog (game/mod_catalog.rs).
 starling-catalog = { path = "../starling-catalog" }
 # Horizon Android's launcher (ha_launcher/): the accounts it lists and signs in, the links it
