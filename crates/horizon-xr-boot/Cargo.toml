@@ -1,0 +1,19 @@
+[package]
+name = "horizon-xr-boot"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Stage 2 VR spike: the OpenXR/Vulkan bootstrap the crates that forbid unsafe code can't make"
+
+[dependencies]
+log = "0.4"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# The versions wgpu-hal and horizon-client already use.
+ash = "=0.38.0"
+openxr = { version = "=0.22.0", features = ["loaded"] }
+
+[lints]
+workspace = true
