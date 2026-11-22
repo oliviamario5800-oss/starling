@@ -1267,7 +1267,7 @@ pub fn warn(message: &str) {
 }
 
 /// The game's console lines in logcat, under the tag `starling`.
-fn logcat(level: log::Level, message: &str) {
+pub(crate) fn logcat(level: log::Level, message: &str) {
     use std::ffi::CString;
     let priority = match level {
         log::Level::Error => 6,

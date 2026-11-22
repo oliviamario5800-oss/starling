@@ -25,12 +25,21 @@ pub fn run_once() {
     if std::env::var_os("HORIZON_NO_XR_SMOKE").is_some() {
         return;
     }
+    // The game's own logcat channel (android::logcat): the `log` crate's facade is not
+    // bridged to it in this app, so `log::info!` would go nowhere (run #11 proved that —
+    // the loader's own trace showed the probe working, but no marker line ever landed).
     match probe() {
         Ok((runtime, system)) => {
-            log::info!("XR_SMOKE: ok runtime_name={runtime:?} system_name={system:?}");
+            crate::android::logcat(
+                log::Level::Info,
+                &format!("XR_SMOKE: ok runtime_name={runtime:?} system_name={system:?}"),
+            );
         }
         Err(error) => {
-            log::warn!("XR_SMOKE: unavailable: {error}");
+            crate::android::logcat(
+                log::Level::Warn,
+                &format!("XR_SMOKE: unavailable: {error}"),
+            );
         }
     }
 }
