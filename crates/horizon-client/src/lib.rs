@@ -10,6 +10,8 @@ pub use horizon_client_lib::*;
 pub mod android;
 #[cfg(target_os = "android")]
 pub mod xr_smoke;
+#[cfg(target_os = "android")]
+pub mod xr_session;
 // Horizon Android 0.7.8's launcher, before the game (ha_launcher/mod.rs).
 #[doc(hidden)]
 pub mod entry;

@@ -1616,6 +1616,9 @@ pub fn main(
     // Stage 2 spike step 2: prove the OpenXR loader answers in this process (xr_smoke.rs).
     // One log line either way; the game continues unchanged.
     crate::xr_smoke::run_once();
+    // Stage 2 spike step 3a: an OpenXR session clearing the two eyes to different
+    // colours, on its own thread (xr_session.rs). The flat game is untouched.
+    crate::xr_session::start_once();
     if !in_game {
         // The launcher's log is its own, so the game's last one stays for the diagnostics.
         logging::init(&private.join("launcher"), "Launcher");
