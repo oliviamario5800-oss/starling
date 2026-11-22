@@ -116,6 +116,9 @@ jni = "0.21.1"
 # dlopens the bundled libopenxr_loader.so at runtime; nothing links against OpenXR, and the
 # dependency is Android-only, so no other target's build changes.
 openxr = { version = "=0.22.0", features = ["loaded"] }
+# Stage 2 spike step 3a: raw Vulkan for the XR session's clear-only stereo
+# (src/xr_session.rs). Already in the tree via wgpu-hal; Android-only here.
+ash = "=0.38.0"
 # The mods, resource packs and shader packs catalog (game/mod_catalog.rs).
 starling-catalog = { path = "../starling-catalog" }
 # Horizon Android's launcher (ha_launcher/): the accounts it lists and signs in, the links it
