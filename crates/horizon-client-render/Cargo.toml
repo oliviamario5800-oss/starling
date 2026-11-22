@@ -17,6 +17,8 @@ horizon-engine-slots = { path = "../horizon-engine-slots" }
 # The GUI atlas's pixels, kept compressed once uploaded (hud.rs `pack_pixels`).
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 horizon-assets = { path = "../horizon-assets" }
+# Stage 2 VR spike: the OpenXR/Vulkan bootstrap (gfx/xr_boot.rs calls it).
+horizon-xr-boot = { path = "../horizon-xr-boot" }
 horizon-client-core = { path = "../horizon-client-core" }
 horizon-client-input = { path = "../horizon-client-input" }
 horizon-command = { path = "../horizon-command" }
