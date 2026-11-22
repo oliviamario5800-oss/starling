@@ -1,0 +1,107 @@
+name: android-build
+# Starling APK builds for Steve's fork, on GitHub's runners (16 GB RAM: the full
+# optimized `fast` profile that this workspace's own 6 GB VM could not codegen).
+#
+# Adapted from the tree's own .github/workflows/android.yml (same sdkmanager
+# pins, same Rust installer, same swap recipe for the fast profile), simplified
+# to arm64-v8a and to the two APKs we sideload on the Quest 3:
+#   starling-0.9.0-arm64-v8a.apk      (release package id, debug-signed)
+#   starling-dev-0.9.0-arm64-v8a.apk  (io.github.juanluci.starling.dev, beside it)
+# Both come from ONE library build: the second command repackages it with
+# --dev --no-build (build_apk.py's own variant mechanism).
+#
+# Signing is build_apk.py's default: without HORIZON_ANDROID_KEYSTORE it signs
+# with a debug key it keeps in target/android (alias horizon-debug, password
+# android). In CI that key is fresh each run, so successive builds cannot
+# install over each other — unless the repo secret STARLING_DEBUG_KEYSTORE_BASE64
+# holds one fixed keystore (see the "Unpack the debug key" step; README.md in
+# the ci/ folder explains how to make one).
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: read
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    # The fast profile is slow to build; the tree's own CI allows the same.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # JDK 25 is build_apk.py's pinned Java major (javac/keytool/apksigner).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      # The exact packages build_apk.py pins: build-tools 35.0.0, the
+      # android-36 platform (its android.jar; TARGET_SDK is 35) and NDK
+      # 28.2.13676358. Same sdkmanager line as the tree's own CI.
+      - name: Install the build-tools, platform and NDK build_apk.py pins
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "build-tools;35.0.0" "platforms;android-36" "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      # The tree's pinned Rust (tools/ci/rust-version, currently 1.99.1),
+      # installed by the tree's own installer, as its CI does. rust-src is
+      # required: build_apk.py builds the std with the game (-Zbuild-std).
+      - name: Install Rust for Android and cargo-ndk
+        run: |
+          bash tools/ci/rustup_install.sh --profile minimal --component rust-src --target aarch64-linux-android
+          cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Cache cargo and the target folder
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      # The fast profile's 16 codegen units of the game's crate took more than
+      # the runner's 16 GB in the tree's own CI: swap on the large temporary
+      # disk, and three build jobs at a time instead of four. (Copied from
+      # .github/workflows/android.yml, "Make room for the release build".)
+      - name: Make room for the fast-profile build
+        run: |
+          sudo swapoff -a || true
+          where=/mnt size=20G
+          avail=$(df --output=avail -BG "$where" 2>/dev/null | tail -1 | tr -dc 0-9)
+          if [ "${avail:-0}" -lt 30 ]; then where=$RUNNER_TEMP size=10G; fi
+          sudo fallocate -l "$size" "$where/release.swap"
+          sudo chmod 600 "$where/release.swap"
+          sudo mkswap "$where/release.swap" > /dev/null
+          sudo swapon "$where/release.swap"
+          free -h
+          echo "CARGO_BUILD_JOBS=3" >> "$GITHUB_ENV"
+      # Optional: one fixed debug keystore for every run, so builds install
+      # over each other. No-op while the secret is unset.
+      - name: Unpack the debug key
+        env:
+          KEYSTORE: ${{ secrets.STARLING_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE" || exit 0
+          mkdir -p target/android
+          echo "$KEYSTORE" | base64 -d > target/android/debug.keystore
+      # Full optimized build (profile fast: inherits release, opt-level 3).
+      # No HORIZON_GAME_BUILD_ID: with a real .git checkout, horizon-mod-host's
+      # build.rs reads the commit from git itself, as it is meant to.
+      - name: Build the release-id APK
+        run: python3 packaging/android/build_apk.py --profile fast
+      - name: Repackage the same library as Starling Dev
+        run: python3 packaging/android/build_apk.py --profile fast --dev --no-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starling-apks-arm64-v8a
+          path: target/android/starling-*.apk
+          if-no-files-found: error
+          retention-days: 90
+      # The unstripped library, to read native crash frames later.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starling-symbols-arm64-v8a
+          path: target/android/lib*-symbols.so
+          if-no-files-found: ignore
+          retention-days: 90
