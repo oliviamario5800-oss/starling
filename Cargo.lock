@@ -2064,6 +2064,7 @@ dependencies = [
  "horizon-theme",
  "horizon-threads",
  "horizon-world",
+ "horizon-xr-boot",
  "image-webp",
  "junction",
  "log",
@@ -2872,6 +2873,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "xxhash-rust",
+]
+
+[[package]]
+name = "horizon-xr-boot"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "log",
+ "openxr",
+ "wgpu",
 ]
 
 [[package]]
