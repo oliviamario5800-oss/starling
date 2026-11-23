@@ -279,6 +279,13 @@ public class StarlingActivity extends NativeActivity {
         runOnUiThread(() -> displayPreferences.set(cutout, orientations, rotation, width, height));
     }
 
+    /** VR: hide the activity's window while the OpenXR session presents, so the
+     *  headset shell drops the floating 2D panel; restore it when VR ends. */
+    public void setGameWindowVisible(final boolean visible) {
+        runOnUiThread(() -> getWindow().getDecorView().setVisibility(
+                visible ? android.view.View.VISIBLE : android.view.View.GONE));
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
