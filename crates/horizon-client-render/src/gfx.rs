@@ -2990,7 +2990,7 @@ impl Renderer {
         // (as an offscreen renderer never would).
         // So is one made on the loading screen's device, whose surface the loading screen keeps
         // drawing on until the handover (`adopt_surface`).
-        let waits_for_window = !offscreen
+        let mut waits_for_window = !offscreen
             && (boot.is_some()
                 || previous
                     .is_some_and(|p| p.suspended && p.surface.is_none() && p.offscreen.is_none()));
@@ -3007,7 +3007,20 @@ impl Renderer {
             configured,
         } = match boot {
             // Opened by `open_device` too, with the window's configuration and capabilities.
-            Some(boot) => boot.into_opened(),
+            Some(boot) => match xr_boot::take_opened() {
+                // The VR spike pre-empts the lent device: the game builds
+                // its world renderer from the loading screen's device, so
+                // the OpenXR bootstrap (`xr_boot`) has to win here, not
+                // only in the no-boot fallback below. Surfaceless; the
+                // renderer does not wait for a window it never presents to.
+                Some((opened, eye)) => {
+                    describe_adapter(&opened.adapter);
+                    xr_eye = Some(eye);
+                    waits_for_window = false;
+                    opened
+                }
+                None => boot.into_opened(),
+            },
             None => match previous {
                 // Reload resources on the same device; replacing live Vulkan
                 // devices can invalidate the driver's swapchain state on the same
