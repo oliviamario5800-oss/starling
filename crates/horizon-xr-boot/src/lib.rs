@@ -94,6 +94,11 @@ mod imp {
         pub frame_stream: openxr::FrameStream<XrVulkan>,
         pub swapchains: Vec<openxr::Swapchain<XrVulkan>>,
         pub images: Vec<Vec<u64>>,
+        /// Swapchain for the menu screen, submitted as a compositor
+        /// quad layer instead of drawn into the eyes.
+        pub menu_swapchain: openxr::Swapchain<XrVulkan>,
+        pub menu_images: Vec<u64>,
+        pub menu_textures: Vec<Option<wgpu::Texture>>,
         pub space: openxr::Space,
         pub views: Vec<openxr::ViewConfigurationView>,
         /// The swapchain format as a raw VkFormat value.
@@ -112,6 +117,13 @@ mod imp {
         pub image_index: u32,
     }
 
+    /// The menu screen's render target for a begun frame: the flat
+    /// frame is drawn into it and the compositor shows it as a quad.
+    pub struct XrMenuTarget {
+        pub texture: wgpu::Texture,
+        pub image_index: u32,
+    }
+
     /// A begun XR frame. `active` is false when the session has not
     /// begun yet: nothing was waited on and [`XrContext::end_frame`]
     /// must not be called for it (it is a no-op if it is).
@@ -122,6 +134,17 @@ mod imp {
         pub display_time: openxr::Time,
         pub eyes: Vec<XrEyeTarget>,
         pub extent: openxr::Extent2Di,
+        /// The located eye views, filled for menu frames too (their
+        /// poses place the screen and the gaze cursor).
+        pub located_views: Vec<openxr::View>,
+        /// The menu target, when this frame was begun as a menu frame.
+        pub menu: Option<XrMenuTarget>,
+        /// Where the compositor should put the menu screen this frame:
+        /// (orientation quaternion xyzw, position, size in metres),
+        /// the pose in the reference space. The renderer fills this in
+        /// before [`XrContext::end_frame`]; without it a menu frame
+        /// submits no layer.
+        pub menu_layer: Option<([f32; 4], [f32; 3], [f32; 2])>,
     }
 
     pub static CTX: Mutex<Option<XrContext>> = Mutex::new(None);
@@ -453,6 +476,26 @@ mod imp {
             swapchains.push(swapchain);
             swapchain_images.push(images);
         }
+        // The menu screen's swapchain: same size and format as an eye,
+        // shown by the compositor as a quad layer on menu frames.
+        let menu_swapchain = stage(
+            "create menu swapchain",
+            session.create_swapchain(&openxr::SwapchainCreateInfo {
+                create_flags: openxr::SwapchainCreateFlags::EMPTY,
+                usage_flags: openxr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                    | openxr::SwapchainUsageFlags::TRANSFER_DST
+                    | openxr::SwapchainUsageFlags::TRANSFER_SRC,
+                format,
+                sample_count: 1,
+                width: view_config[0].recommended_image_rect_width,
+                height: view_config[0].recommended_image_rect_height,
+                face_count: 1,
+                array_size: 1,
+                mip_count: 1,
+            }),
+        )?;
+        let menu_images = stage("menu swapchain images", menu_swapchain.enumerate_images())?;
+        let menu_textures = vec![None; menu_images.len()];
         let eye = (
             view_config[0].recommended_image_rect_width,
             view_config[0].recommended_image_rect_height,
@@ -476,6 +519,9 @@ mod imp {
             frame_stream,
             swapchains,
             images: swapchain_images,
+            menu_swapchain,
+            menu_images,
+            menu_textures,
             space,
             views: view_config,
             format,
@@ -557,14 +603,18 @@ mod imp {
         }
 
         /// Wait for the next frame, begin it, locate the eye views and
-        /// acquire both swapchain images, wrapped as wgpu textures. A
-        /// frame that should not render (or whose poses are invalid)
-        /// comes back with `should_render` false and no eyes; end it
-        /// with [`Self::end_frame`] all the same.
+        /// acquire the frame's render targets, wrapped as wgpu
+        /// textures: both eye images for a stereo frame, or the menu
+        /// swapchain's image when `want_menu` (the eyes are located
+        /// but not acquired then). A frame that should not render (or
+        /// whose poses are invalid) comes back with `should_render`
+        /// false and no targets; end it with [`Self::end_frame`] all
+        /// the same.
         pub fn begin_frame(
             &mut self,
             device: &wgpu::Device,
             wgpu_format: wgpu::TextureFormat,
+            want_menu: bool,
         ) -> StageResult<XrFrame> {
             let extent = openxr::Extent2Di {
                 width: self.views[0].recommended_image_rect_width as i32,
@@ -577,6 +627,9 @@ mod imp {
                 display_time: openxr::Time::from_nanos(0),
                 eyes: Vec::new(),
                 extent,
+                located_views: Vec::new(),
+                menu: None,
+                menu_layer: None,
             };
             if !self.poll_events()? {
                 return Ok(skip);
@@ -605,6 +658,35 @@ mod imp {
                 return Ok(frame);
             }
             frame.should_render = true;
+            frame.located_views = views.clone();
+            if want_menu {
+                // Menu frames acquire the menu image AND both eye
+                // images: the eyes carry a cleared projection layer
+                // under the menu quad, so the compositor always gets
+                // the base layer it expects.
+                let index = stage("acquire menu image", self.menu_swapchain.acquire_image())?;
+                stage(
+                    "wait menu image",
+                    self.menu_swapchain.wait_image(openxr::Duration::INFINITE),
+                )?;
+                if self.menu_textures[index as usize].is_none() {
+                    let texture = wrap_swapchain_image(
+                        device,
+                        self.menu_images[index as usize],
+                        wgpu_format,
+                        extent,
+                    )?;
+                    self.menu_textures[index as usize] = Some(texture);
+                }
+                let texture = self.menu_textures[index as usize]
+                    .as_ref()
+                    .expect("just wrapped")
+                    .clone();
+                frame.menu = Some(XrMenuTarget {
+                    texture,
+                    image_index: index,
+                });
+            }
             for (eye, view) in views.iter().take(2).enumerate() {
                 let index = stage("acquire image", self.swapchains[eye].acquire_image())?;
                 stage(
@@ -641,12 +723,52 @@ mod imp {
             if !frame.active {
                 return;
             }
+            if frame.menu.is_some() {
+                if let Err(error) = self.menu_swapchain.release_image() {
+                    log::warn!("XR_FRAME: release menu image failed (continuing): {error}");
+                }
+            }
             for (eye, _) in frame.eyes.iter().enumerate() {
                 if let Err(error) = self.swapchains[eye].release_image() {
                     log::warn!("XR_FRAME: release image {eye} failed (continuing): {error}");
                 }
             }
-            let result = if frame.should_render && frame.views_valid && frame.eyes.len() == 2 {
+            // The menu quad (built inline in the branches that submit
+            // it; the layer types borrow the swapchain handles).
+            macro_rules! menu_quad {
+                ($orientation:expr, $position:expr, $size:expr, $extent:expr) => {
+                    openxr::CompositionLayerQuad::new()
+                        .space(&self.space)
+                        .eye_visibility(openxr::EyeVisibility::BOTH)
+                        .sub_image(
+                            openxr::SwapchainSubImage::new()
+                                .swapchain(&self.menu_swapchain)
+                                .image_rect(openxr::Rect2Di {
+                                    offset: openxr::Offset2Di { x: 0, y: 0 },
+                                    extent: $extent,
+                                }),
+                        )
+                        .pose(openxr::Posef {
+                            orientation: openxr::Quaternionf {
+                                x: $orientation[0],
+                                y: $orientation[1],
+                                z: $orientation[2],
+                                w: $orientation[3],
+                            },
+                            position: openxr::Vector3f {
+                                x: $position[0],
+                                y: $position[1],
+                                z: $position[2],
+                            },
+                        })
+                        .size(openxr::Extent2Df {
+                            width: $size[0],
+                            height: $size[1],
+                        })
+                };
+            }
+            let stereo_ok = frame.should_render && frame.views_valid && frame.eyes.len() == 2;
+            let result = if stereo_ok {
                 let proj_views: Vec<openxr::CompositionLayerProjectionView<'_, XrVulkan>> = frame
                     .eyes
                     .iter()
@@ -668,11 +790,39 @@ mod imp {
                 let layer = openxr::CompositionLayerProjection::new()
                     .space(&self.space)
                     .views(&proj_views);
-                self.frame_stream.end(
-                    frame.display_time,
-                    openxr::EnvironmentBlendMode::OPAQUE,
-                    &[&layer],
-                )
+                match frame.menu_layer {
+                    // Menu frame: the cleared eyes as the base layer,
+                    // the screen quad on top.
+                    Some((orientation, position, size)) => {
+                        let quad = menu_quad!(orientation, position, size, frame.extent);
+                        self.frame_stream.end(
+                            frame.display_time,
+                            openxr::EnvironmentBlendMode::OPAQUE,
+                            &[&layer, &quad],
+                        )
+                    }
+                    None => self.frame_stream.end(
+                        frame.display_time,
+                        openxr::EnvironmentBlendMode::OPAQUE,
+                        &[&layer],
+                    ),
+                }
+            } else if frame.should_render && frame.views_valid {
+                match frame.menu_layer {
+                    Some((orientation, position, size)) => {
+                        let quad = menu_quad!(orientation, position, size, frame.extent);
+                        self.frame_stream.end(
+                            frame.display_time,
+                            openxr::EnvironmentBlendMode::OPAQUE,
+                            &[&quad],
+                        )
+                    }
+                    None => self.frame_stream.end(
+                        frame.display_time,
+                        openxr::EnvironmentBlendMode::OPAQUE,
+                        &[],
+                    ),
+                }
             } else {
                 self.frame_stream.end(
                     frame.display_time,
@@ -765,4 +915,4 @@ mod imp {
 /// The live XR context for the frame driver (Android only; the render
 /// loop's XR bracketing locks it once per frame).
 #[cfg(target_os = "android")]
-pub use imp::{CTX, XrContext, XrEyeTarget, XrFrame};
+pub use imp::{CTX, XrContext, XrEyeTarget, XrFrame, XrMenuTarget};
