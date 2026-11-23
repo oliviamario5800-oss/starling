@@ -3154,7 +3154,13 @@ impl Renderer {
             config.width = eye_width.clamp(1, max_side);
             config.height = eye_height.clamp(1, max_side);
             config.format = eye_format;
+            // The frame is drawn through the sRGB-stripped spelling of
+            // the output format, so both spellings are legal views.
             config.view_formats = vec![eye_format];
+            let stripped = eye_format.remove_srgb_suffix();
+            if stripped != eye_format {
+                config.view_formats.push(stripped);
+            }
         }
         let offscreen = (surface.is_none() && !waits_for_window)
             .then(|| Self::offscreen_target(&device, &config));
