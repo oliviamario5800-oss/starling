@@ -884,8 +884,22 @@ mod imp {
                     .state(session, null)
                     .map(|state| state.is_active)
                     .unwrap_or(false);
+                let profile = |hand: &str| -> String {
+                    let Ok(user) = self.instance.string_to_path(hand) else {
+                        return "?".to_string();
+                    };
+                    match session.current_interaction_profile(user) {
+                        Ok(profile) => self
+                            .instance
+                            .path_to_string(profile)
+                            .unwrap_or_else(|_| "<unnamed>".to_string()),
+                        Err(error) => format!("err {error:?}"),
+                    }
+                };
                 log::info!(
-                    "XR_INPUT: L{:?} R{:?} T[{:.2} {:.2}] btns S{} E{} W{} N{} M{} aimL{} aimR{} act[stickL:{} trigR:{} south:{}]",
+                    "XR_INPUT: prof[L:{} R:{}] L{:?} R{:?} T[{:.2} {:.2}] btns S{} E{} W{} N{} M{} aimL{} aimR{} act[stickL:{} trigR:{} south:{}]",
+                    profile("/user/hand/left"),
+                    profile("/user/hand/right"),
                     snapshot.left_stick,
                     snapshot.right_stick,
                     snapshot.left_trigger,
