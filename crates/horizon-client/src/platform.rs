@@ -31,6 +31,9 @@ pub struct Hooks {
     /// the system's notification), or let that reason go: a phone may cut a background app's
     /// internet, or end it, while the player signs in in the browser.
     pub keep_working: fn(&str, &str, bool),
+    /// Show or hide the game's own window: VR hides it while the OpenXR session
+    /// presents, so the headset shell drops the floating 2D panel.
+    pub set_game_window_visible: fn(bool),
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
@@ -64,6 +67,13 @@ pub fn clipboard_get() -> Option<Option<String>> {
 /// The platform's clipboard: None without one registered.
 pub fn clipboard_set(text: &str) -> Option<bool> {
     HOOKS.get().map(|h| (h.clipboard_set)(text))
+}
+
+/// Show or hide the game's own window; nothing without a platform.
+pub fn set_game_window_visible(visible: bool) {
+    if let Some(h) = HOOKS.get() {
+        (h.set_game_window_visible)(visible);
+    }
 }
 
 /// Holds the game in the foreground for `reason` (or lets it go); nothing without a platform.
