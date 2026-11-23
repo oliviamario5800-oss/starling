@@ -66,24 +66,47 @@ impl super::Renderer {
         }
         let surface = self.surface.take();
         let mut drawn: std::result::Result<bool, Box<dyn std::error::Error>> = Ok(true);
-        for eye in &xr_frame.eyes {
-            let view = eye_view(frame, eye);
-            let depth = Self::depth(&self.device, &self.config);
-            let offscreen = std::mem::replace(&mut self.offscreen, Some(eye.texture.clone()));
-            let window_depth = std::mem::replace(&mut self.depth, depth);
-            self.view_override = Some(super::ViewSet::single(view));
-            let result = self.draw_frame(frame, None, self.output);
-            self.view_override = None;
-            self.depth = window_depth;
-            self.offscreen = offscreen;
-            match result {
-                Ok(true) => {}
-                Ok(false) => drawn = Ok(false),
-                Err(error) => {
-                    drawn = Err(error);
-                    break;
-                }
+        // Diagnostic (2026-11-23): draw the left eye only and copy its
+        // image into the right eye. If the pair then fuses cleanly, the
+        // fault is in the per-eye view/projection math; if it still
+        // does not fuse, the fault is in the layer presentation.
+        log::info!("XR_FRAME: diagnostic identical-eyes copy");
+        let left = &xr_frame.eyes[0];
+        let view = eye_view(frame, left);
+        let depth = Self::depth(&self.device, &self.config);
+        let offscreen = std::mem::replace(&mut self.offscreen, Some(left.texture.clone()));
+        let window_depth = std::mem::replace(&mut self.depth, depth);
+        self.view_override = Some(super::ViewSet::single(view));
+        let result = self.draw_frame(frame, None, self.output);
+        self.view_override = None;
+        self.depth = window_depth;
+        self.offscreen = offscreen;
+        match result {
+            Ok(true) => {
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("XR eye copy"),
+                        });
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &xr_frame.eyes[0].texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &xr_frame.eyes[1].texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    xr_frame.eyes[0].texture.size(),
+                );
+                self.queue.submit([encoder.finish()]);
             }
+            Ok(false) => drawn = Ok(false),
+            Err(error) => drawn = Err(error),
         }
         self.surface = surface;
         // The compositor may not have the images until the work is done.
