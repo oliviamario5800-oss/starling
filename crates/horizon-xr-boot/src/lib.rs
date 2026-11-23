@@ -700,6 +700,15 @@ mod imp {
             height: extent.height as u32,
             depth_or_array_layers: 1,
         };
+        // The renderer draws into its output through an sRGB-stripped
+        // view (its output format is the surface format minus the sRGB
+        // suffix), so the wrapped image must declare both spellings or
+        // the first frame's view creation fails validation.
+        let stripped = format.remove_srgb_suffix();
+        let mut view_formats = vec![format];
+        if stripped != format {
+            view_formats.push(stripped);
+        }
         // SAFETY: the device wraps the hal device the session was
         // created on (the bootstrap built both from the same handles).
         let hal_device = unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }
@@ -713,7 +722,7 @@ mod imp {
             format,
             usage: wgpu::TextureUses::COLOR_TARGET,
             memory_flags: wgpu::hal::MemoryFlags::empty(),
-            view_formats: Vec::new(),
+            view_formats: view_formats.clone(),
         };
         // SAFETY: the image belongs to this session's swapchain, is
         // acquired and waited on, and outlives the returned texture
@@ -739,7 +748,7 @@ mod imp {
                     dimension: wgpu::TextureDimension::D2,
                     format,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
+                    view_formats: &view_formats,
                 },
                 wgpu::TextureUses::UNINITIALIZED,
             )
