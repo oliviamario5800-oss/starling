@@ -643,6 +643,47 @@ impl Game<'_> {
         self.pad_pointer_button(event_loop, right, false);
     }
 
+    /// The XR aim pointer in menus (Stage 3): the render shim
+    /// publishes where the controller's ray meets the menu screen;
+    /// drive the game's cursor with it, and click with the trigger.
+    #[cfg(target_os = "android")]
+    pub(super) fn xr_menu_pointer(&mut self, event_loop: &dyn EventLoopCtl) {
+        if !self.pad_in_menu() {
+            // Leaving the menu mid-press must not stick the button.
+            if self.pad.xr_menu_trigger >= 0.5 {
+                self.pad_pointer_button(event_loop, false, false);
+            }
+            self.pad.xr_menu_trigger = 0.0;
+            return;
+        }
+        let Some(snapshot) = horizon_client_render::gfx::xr_boot::input_snapshot() else {
+            // The session went away mid-press: release and reset.
+            if self.pad.xr_menu_trigger >= 0.5 {
+                self.pad_pointer_button(event_loop, false, false);
+            }
+            self.pad.xr_menu_trigger = 0.0;
+            return;
+        };
+        let Some(uv) = snapshot.menu_uv else {
+            // Pointing off the screen mid-press releases the click.
+            if self.pad.xr_menu_trigger >= 0.5 {
+                self.pad_pointer_button(event_loop, false, false);
+            }
+            self.pad.xr_menu_trigger = snapshot.menu_trigger;
+            return;
+        };
+        let Some(batch) = self.gui_batch() else {
+            return;
+        };
+        self.pad_pointer_to(event_loop, (uv[0] * batch.width, uv[1] * batch.height));
+        let down = snapshot.menu_trigger >= 0.5;
+        let was = self.pad.xr_menu_trigger >= 0.5;
+        if down != was {
+            self.pad_pointer_button(event_loop, false, down);
+        }
+        self.pad.xr_menu_trigger = snapshot.menu_trigger;
+    }
+
     /// The wheel event being handled only scrolls (`MenuCursor::stick_scroll`).
     pub(super) fn pad_stick_scroll(&self) -> bool {
         self.pad.menu.stick_scroll || self.pad.menu.step_scroll
