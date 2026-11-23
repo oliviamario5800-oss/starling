@@ -179,6 +179,8 @@ mod imp {
         pub actions: Option<XrActions>,
         /// A sync failure was already logged (don't spam per frame).
         pub input_warned: bool,
+        /// Frames since boot, for the input debug log's rate limit.
+        pub input_log_tick: u32,
     }
 
     /// The OpenXR action set for the Touch controllers and the aim
@@ -633,6 +635,7 @@ mod imp {
             textures,
             actions,
             input_warned: false,
+            input_log_tick: 0,
         });
         Ok(Boot {
             instance: wgpu_instance,
@@ -861,6 +864,44 @@ mod imp {
                 aim_right: aim(&actions.aim_right_space),
                 ..super::InputSnapshot::empty()
             };
+            // Debug (Stage 3 diagnosis): the values the runtime
+            // actually reports, twice a second.
+            self.input_log_tick = self.input_log_tick.wrapping_add(1);
+            if self.input_log_tick % 36 == 0 {
+                let active = |is: bool| if is { 1 } else { 0 };
+                let stick_active = actions
+                    .left_stick
+                    .state(session, null)
+                    .map(|state| state.is_active)
+                    .unwrap_or(false);
+                let trigger_active = actions
+                    .right_trigger
+                    .state(session, null)
+                    .map(|state| state.is_active)
+                    .unwrap_or(false);
+                let south_active = actions
+                    .south
+                    .state(session, null)
+                    .map(|state| state.is_active)
+                    .unwrap_or(false);
+                log::info!(
+                    "XR_INPUT: L{:?} R{:?} T[{:.2} {:.2}] btns S{} E{} W{} N{} M{} aimL{} aimR{} act[stickL:{} trigR:{} south:{}]",
+                    snapshot.left_stick,
+                    snapshot.right_stick,
+                    snapshot.left_trigger,
+                    snapshot.right_trigger,
+                    active(snapshot.south),
+                    active(snapshot.east),
+                    active(snapshot.west),
+                    active(snapshot.north),
+                    active(snapshot.menu),
+                    active(snapshot.aim_left.is_some()),
+                    active(snapshot.aim_right.is_some()),
+                    active(stick_active),
+                    active(trigger_active),
+                    active(south_active),
+                );
+            }
             let mut guard = super::INPUT
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
