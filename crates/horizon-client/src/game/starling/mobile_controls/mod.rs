@@ -367,6 +367,12 @@ impl Game<'_> {
     }
     pub(in crate::game) fn mobile_draw(&self, b: &mut HudBatch) {
         use horizon_client::android_control_ui as ui;
+        // VR: the touch overlay (joystick, buttons, hub, OSK) has no
+        // place inside the headset — controllers replace it entirely.
+        // Same liveness signal as the pad merge: an active XR snapshot.
+        if horizon_client_render::gfx::xr_boot::input_snapshot().is_some() {
+            return;
+        }
         if !self.has_touch()
             && !self.settings.keypad.enabled
             && self.mobile.controls.editor.is_none()
