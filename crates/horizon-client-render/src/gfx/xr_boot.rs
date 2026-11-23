@@ -17,6 +17,26 @@ pub fn init(vm: *mut std::ffi::c_void, activity: *mut std::ffi::c_void) {
     horizon_xr_boot::init(vm, activity);
 }
 
+/// The XR controller input snapshot type, re-exported for the
+/// game's pad polling.
+pub use horizon_xr_boot::InputSnapshot;
+
+/// The latest XR controller input, for the game's pad polling
+/// (Stage 3). `None` when no XR session is publishing input.
+pub fn input_snapshot() -> Option<horizon_xr_boot::InputSnapshot> {
+    #[cfg(target_os = "android")]
+    {
+        let snapshot = *horizon_xr_boot::INPUT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        snapshot.active.then_some(snapshot)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        None
+    }
+}
+
 /// The bootstrap result, run at most once per process.
 static BOOT: OnceLock<Option<horizon_xr_boot::Boot>> = OnceLock::new();
 
@@ -74,6 +94,10 @@ impl super::Renderer {
         // A stereo frame ends any menu visit: the next menu places
         // its screen afresh in front of the user.
         *MENU_SCREEN.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        horizon_xr_boot::INPUT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .menu_uv = None;
         let surface = self.surface.take();
         let mut drawn: std::result::Result<bool, Box<dyn std::error::Error>> = Ok(true);
         for eye in &xr_frame.eyes {
@@ -177,6 +201,47 @@ impl super::Renderer {
             }
             placement.expect("just placed")
         };
+        // The controller's aim ray against the screen: where it
+        // lands, as UV over the menu texture, published for the
+        // game's menu pointer (and used for the patch below, so the
+        // player sees where the controller points). The right hand
+        // aims when tracked, else the left.
+        let aim_uv = {
+            let snapshot = *horizon_xr_boot::INPUT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let (aim, trigger) = match snapshot.aim_right {
+                Some(aim) => (Some(aim), snapshot.right_trigger),
+                None => (snapshot.aim_left, snapshot.left_trigger),
+            };
+            let uv = aim.and_then(|(quat, pos)| {
+                let quat = glam::Quat::from_xyzw(quat[0], quat[1], quat[2], quat[3]);
+                let dir = quat * glam::Vec3::NEG_Z;
+                let origin = glam::Vec3::from_array(pos);
+                let basis =
+                    glam::Mat4::from_rotation_translation(screen.quat, screen.center);
+                let normal = screen.quat * glam::Vec3::Z;
+                let denom = dir.dot(normal);
+                if denom.abs() <= 1e-6 {
+                    return None;
+                }
+                let t = (screen.center - origin).dot(normal) / denom;
+                if t <= 0.0 {
+                    return None;
+                }
+                let hit = origin + dir * t;
+                let local = basis.inverse() * hit.extend(1.0);
+                let u = local.x / screen.width + 0.5;
+                let v = 0.5 - local.y / screen.height;
+                ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then_some([u, v])
+            });
+            let mut guard = horizon_xr_boot::INPUT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard.menu_uv = uv;
+            guard.menu_trigger = trigger;
+            uv
+        };
         // The flat frame into the menu texture.
         let surface = self.surface.take();
         let depth = Self::depth(&self.device, &self.config);
@@ -227,53 +292,57 @@ impl super::Renderer {
             });
             self.queue.submit([encoder.finish()]);
         }
-        // The gaze patch: where the head's forward ray crosses the
-        // screen, copied in as a small white square.
-        let basis = glam::Mat4::from_rotation_translation(screen.quat, screen.center);
-        let ray_dir = head_quat * glam::Vec3::NEG_Z;
-        let normal = screen.quat * glam::Vec3::Z;
-        let denom = ray_dir.dot(normal);
-        if denom.abs() > 1e-6 {
-            let t = (screen.center - head_pos).dot(normal) / denom;
-            if t > 0.0 {
-                let hit = head_pos + ray_dir * t;
-                let local = basis.inverse() * hit.extend(1.0);
-                let u = local.x / screen.width + 0.5;
-                let v = 0.5 - local.y / screen.height;
-                if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
-                    let patch = 24u32;
-                    let x = ((u * self.config.width as f32) as i32 - patch as i32 / 2)
-                        .clamp(0, (self.config.width - patch) as i32) as u32;
-                    let y = ((v * self.config.height as f32) as i32 - patch as i32 / 2)
-                        .clamp(0, (self.config.height - patch) as i32) as u32;
-                    let white = white_patch(&self.device, &self.queue);
-                    let mut encoder = self.device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
-                            label: Some("XR menu gaze patch"),
-                        },
-                    );
-                    encoder.copy_texture_to_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &white,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &menu_texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d { x, y, z: 0 },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::Extent3d {
-                            width: patch,
-                            height: patch,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                    self.queue.submit([encoder.finish()]);
-                }
+        // The pointer patch: where the aim ray crosses the screen
+        // (or, with no controller tracked, the head's forward ray),
+        // copied in as a small white square.
+        let patch_uv = aim_uv.or_else(|| {
+            let basis = glam::Mat4::from_rotation_translation(screen.quat, screen.center);
+            let ray_dir = head_quat * glam::Vec3::NEG_Z;
+            let normal = screen.quat * glam::Vec3::Z;
+            let denom = ray_dir.dot(normal);
+            if denom.abs() <= 1e-6 {
+                return None;
             }
+            let t = (screen.center - head_pos).dot(normal) / denom;
+            if t <= 0.0 {
+                return None;
+            }
+            let hit = head_pos + ray_dir * t;
+            let local = basis.inverse() * hit.extend(1.0);
+            let u = local.x / screen.width + 0.5;
+            let v = 0.5 - local.y / screen.height;
+            ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then_some([u, v])
+        });
+        if let Some([u, v]) = patch_uv {
+            let patch = 24u32;
+            let x = ((u * self.config.width as f32) as i32 - patch as i32 / 2)
+                .clamp(0, (self.config.width - patch) as i32) as u32;
+            let y = ((v * self.config.height as f32) as i32 - patch as i32 / 2)
+                .clamp(0, (self.config.height - patch) as i32) as u32;
+            let white = white_patch(&self.device, &self.queue);
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("XR menu pointer patch"),
+            });
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &white,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &menu_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: patch,
+                    height: patch,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit([encoder.finish()]);
         }
         if XR_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 300 == 0 {
             self.capture_xr(&[&menu_texture], "xr-menu.bmp");
