@@ -523,6 +523,20 @@ pub fn hide_keyboard() {
     });
 }
 
+/// VR: hide the activity's window while the OpenXR session presents (the Quest
+/// shell otherwise keeps it as a floating black panel in front of the world).
+fn set_game_window_visible(visible: bool) {
+    with_activity(|env, activity| {
+        env.call_method(
+            activity,
+            "setGameWindowVisible",
+            "(Z)V",
+            &[jni::objects::JValue::Bool(u8::from(visible))],
+        )
+        .map(drop)
+    });
+}
+
 /// Start the game again in a new process (the game folder is chosen at start). A restart the game
 /// asks for comes back to the game, not to the launcher (ha_launcher).
 pub fn restart_app() {
@@ -1609,6 +1623,7 @@ pub fn main(
         library_dir,
         asset,
         keep_working,
+        set_game_window_visible,
     });
     horizon_protocol::set_name_servers(dns_servers);
     let _ = ARGS.set(args.clone());
