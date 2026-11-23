@@ -1255,6 +1255,10 @@ pub struct Renderer {
     /// The views the next `draw_frame` uses instead of the screen's (the
     /// VR spike's per-eye draws set this for one call at a time).
     view_override: Option<ViewSet>,
+    /// Whether this renderer draws to the headset (the VR spike): its
+    /// device and frame size belong to OpenXR, so the window's surface
+    /// and size at the loading handover are not its to adopt.
+    is_xr: bool,
     /// Offscreen submissions still on the GPU: at most two frames run ahead.
     in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
     /// Splitscreen: the caller waits for the GPU once every player has submitted
@@ -3145,6 +3149,7 @@ impl Renderer {
         };
         // The VR spike draws into the headset's swapchain images, whose
         // size and format the fabricated configuration adopts.
+        let is_xr = xr_eye.is_some();
         if let Some((eye_width, eye_height, eye_format)) = xr_eye {
             config.width = eye_width.clamp(1, max_side);
             config.height = eye_height.clamp(1, max_side);
@@ -5403,6 +5408,7 @@ impl Renderer {
             spare_surface: std::sync::Mutex::new(None),
             offscreen,
             view_override: None,
+            is_xr,
             in_flight: std::collections::VecDeque::new(),
             paced_elsewhere: false,
             first_frame: if previous.is_none() {
@@ -5920,6 +5926,12 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<()> {
+        if self.is_xr {
+            // The headset owns this renderer's frames: the surface was
+            // made on the boot renderer's instance and the window's size
+            // is not the eye's. Drop the surface unconfigured.
+            return Ok(());
+        }
         *self
             .spare_surface
             .get_mut()
@@ -5928,6 +5940,13 @@ impl Renderer {
     }
     /// The window is back, maybe at another size: a new surface on it.
     pub fn resume(&mut self, width: u32, height: u32) -> Result<()> {
+        if self.is_xr {
+            // The headset owns this renderer's frames: the window's size
+            // is not the eye's and there is no surface to remake.
+            self.suspended = false;
+            self.detached = false;
+            return Ok(());
+        }
         if !drawable_size(width, height, self.device.limits().max_texture_dimension_2d) {
             return Ok(());
         }
