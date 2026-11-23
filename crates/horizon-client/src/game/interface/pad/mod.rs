@@ -524,7 +524,21 @@ impl Game<'_> {
             let xr = horizon_client_render::gfx::xr_boot::input_snapshot();
             self.pad.xr_active = xr.is_some();
             if let Some(snapshot) = xr {
-                state = state.merge(&xr_pad_state(&snapshot));
+                let xr_state = xr_pad_state(&snapshot);
+                // Debug (Stage 3 diagnosis): what the game merges.
+                static XR_LOG_TICK: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let tick = XR_LOG_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if tick % 300 == 0 {
+                    log::info!(
+                        "XR_PAD: merging L{:?} R{:?} T{:?} buttons {:#x}",
+                        xr_state.left,
+                        xr_state.right,
+                        xr_state.triggers,
+                        xr_state.buttons
+                    );
+                }
+                state = state.merge(&xr_state);
             }
         }
         let activity = self.pad.activity.observe(&state, &self.settings.controller);
