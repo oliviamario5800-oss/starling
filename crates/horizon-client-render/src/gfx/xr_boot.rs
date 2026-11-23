@@ -96,6 +96,14 @@ impl super::Renderer {
             }
         }
         self.surface = surface;
+        // Diagnostic capture: every few seconds, save what the eyes
+        // actually received (see `capture_xr`).
+        if XR_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 300 == 0 {
+            self.capture_xr(
+                &[&xr_frame.eyes[0].texture, &xr_frame.eyes[1].texture],
+                "xr-eyes.bmp",
+            );
+        }
         // The compositor may not have the images until the work is done.
         self.wait_submissions();
         ctx.end_frame(xr_frame);
@@ -267,6 +275,9 @@ impl super::Renderer {
                 }
             }
         }
+        if XR_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 300 == 0 {
+            self.capture_xr(&[&menu_texture], "xr-menu.bmp");
+        }
         xr_frame.menu_layer = Some((
             [screen.quat.x, screen.quat.y, screen.quat.z, screen.quat.w],
             [screen.center.x, screen.center.y, screen.center.z],
@@ -341,6 +352,153 @@ fn white_patch(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture {
             texture
         })
         .clone()
+}
+
+/// Frame counter for the diagnostic capture (see `capture_xr`).
+#[cfg(target_os = "android")]
+static XR_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "android")]
+impl super::Renderer {
+    /// Diagnostic capture (2026-11-23): read the given XR textures
+    /// back and save them side by side, half size, as a BMP in the
+    /// player's screenshots folder, so the exact images each eye
+    /// receives can be inspected off-device. The file work runs on a
+    /// detached thread; the render thread only pays the readback.
+    fn capture_xr(&mut self, textures: &[&wgpu::Texture], name: &str) {
+        // The textures' own size, not the renderer's config: the menu
+        // texture is not the eye size by contract, only by today's
+        // construction (agy review, 2026-11-23).
+        let width = textures[0].width();
+        let height = textures[0].height();
+        let row = width * 4;
+        let padded = row.div_ceil(256) * 256;
+        let size = u64::from(padded) * u64::from(height);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("XR capture"),
+        });
+        let mut buffers = Vec::new();
+        for texture in textures {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("XR capture"),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            buffers.push(buffer);
+        }
+        self.queue.submit([encoder.finish()]);
+        let mut images = Vec::new();
+        for buffer in &buffers {
+            let slice = buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            match rx.recv() {
+                Ok(Ok(())) => match slice.get_mapped_range() {
+                    Ok(data) => {
+                        images.push(data.to_vec());
+                        drop(data);
+                    }
+                    Err(_) => {
+                        log::warn!("XR_CAPTURE: readback failed");
+                        return;
+                    }
+                },
+                _ => {
+                    log::warn!("XR_CAPTURE: readback failed");
+                    return;
+                }
+            }
+            buffer.unmap();
+        }
+        let path = crate::logging::player_dir().join("screenshots").join(name);
+        std::thread::spawn(move || {
+            // One writer at a time: two captures writing the same
+            // file could interleave and corrupt it (agy review).
+            static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = WRITER.lock();
+            if write_side_by_side_bmp(&path, &images, width, height, padded).is_ok() {
+                log::info!("XR_CAPTURE: saved {}", path.display());
+            }
+        });
+    }
+}
+
+/// Write RGBA readbacks (rows padded to `padded` bytes) as one
+/// 24-bit BMP: each image at half size, side by side.
+#[cfg(target_os = "android")]
+fn write_side_by_side_bmp(
+    path: &std::path::Path,
+    images: &[Vec<u8>],
+    width: u32,
+    height: u32,
+    padded: u32,
+) -> std::io::Result<()> {
+    let half_w = width / 2;
+    let half_h = height / 2;
+    let out_w = half_w * images.len() as u32;
+    let out_h = half_h;
+    let row_bytes = (out_w * 3).div_ceil(4) * 4;
+    let pixel_bytes = row_bytes * out_h;
+    let file_size = 54 + pixel_bytes;
+    let mut out = Vec::with_capacity(file_size as usize);
+    // BITMAPFILEHEADER + BITMAPINFOHEADER.
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&file_size.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(out_w as i32).to_le_bytes());
+    out.extend_from_slice(&(out_h as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&pixel_bytes.to_le_bytes());
+    out.extend_from_slice(&2835i32.to_le_bytes());
+    out.extend_from_slice(&2835i32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    // Rows are stored bottom-up; each output pixel samples the
+    // source at twice the coordinates (nearest neighbour, half size).
+    for oy in 0..out_h {
+        let sy = (out_h - 1 - oy) * 2;
+        for image in images {
+            for ox in 0..half_w {
+                let sx = ox * 2;
+                let at = (sy * padded + sx * 4) as usize;
+                out.extend_from_slice(&[image[at + 2], image[at + 1], image[at]]);
+            }
+        }
+        out.resize(out.len() + (row_bytes - out_w * 3) as usize, 0);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, out)
 }
 
 /// One eye's [`super::View`] from its OpenXR pose and asymmetric field
