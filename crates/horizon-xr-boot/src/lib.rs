@@ -63,6 +63,72 @@ pub struct Boot {
     pub eye: (u32, u32, wgpu::TextureFormat),
 }
 
+/// The latest controller input, published by the XR frame driver
+/// every frame (Stage 3) and read by the game's pad polling. Plain
+/// data in the game's terms: sticks are `[x, y]` with right and up
+/// positive, triggers run 0..1, the face buttons are named by their
+/// position (south = the Quest controller's A, east = B, west = X,
+/// north = Y). `menu_uv` / `menu_trigger` are the render shim's to
+/// fill on menu frames (it owns the screen's placement); the frame
+/// driver preserves them across its per-frame overwrite.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InputSnapshot {
+    /// The session is running and actions synced this frame.
+    pub active: bool,
+    pub left_stick: [f32; 2],
+    pub right_stick: [f32; 2],
+    pub left_trigger: f32,
+    pub right_trigger: f32,
+    pub south: bool,
+    pub east: bool,
+    pub west: bool,
+    pub north: bool,
+    /// The left controller's menu button.
+    pub menu: bool,
+    pub left_stick_click: bool,
+    pub right_stick_click: bool,
+    /// Aim poses in the reference space: (quaternion xyzw, position).
+    pub aim_left: Option<([f32; 4], [f32; 3])>,
+    pub aim_right: Option<([f32; 4], [f32; 3])>,
+    /// Where the aim ray meets the menu screen: 0..1 over the menu
+    /// texture, y down. Set by the render shim on menu frames.
+    pub menu_uv: Option<[f32; 2]>,
+    /// The aiming hand's trigger value, for menu clicks.
+    pub menu_trigger: f32,
+}
+
+impl InputSnapshot {
+    pub const fn empty() -> Self {
+        Self {
+            active: false,
+            left_stick: [0.0; 2],
+            right_stick: [0.0; 2],
+            left_trigger: 0.0,
+            right_trigger: 0.0,
+            south: false,
+            east: false,
+            west: false,
+            north: false,
+            menu: false,
+            left_stick_click: false,
+            right_stick_click: false,
+            aim_left: None,
+            aim_right: None,
+            menu_uv: None,
+            menu_trigger: 0.0,
+        }
+    }
+}
+
+impl Default for InputSnapshot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+/// The shared input snapshot (see [`InputSnapshot`]).
+pub static INPUT: std::sync::Mutex<InputSnapshot> = std::sync::Mutex::new(InputSnapshot::empty());
+
 /// Run the bootstrap. `Err` carries a stage-tagged reason; the caller
 /// logs it and falls back to the flat device search.
 #[cfg(not(target_os = "android"))]
@@ -108,6 +174,31 @@ mod imp {
         /// Wrapped swapchain images, per eye per image index, created on
         /// first acquire and reused for the session's lifetime.
         pub textures: [Vec<Option<wgpu::Texture>>; 2],
+        /// The controller actions (Stage 3); None when their setup
+        /// failed — input is an addition, never a boot requirement.
+        pub actions: Option<XrActions>,
+        /// A sync failure was already logged (don't spam per frame).
+        pub input_warned: bool,
+    }
+
+    /// The OpenXR action set for the Touch controllers and the aim
+    /// spaces derived from it. One action per hand and control (no
+    /// subaction paths): the bindings name the hand's path directly.
+    pub struct XrActions {
+        pub set: openxr::ActionSet,
+        pub left_stick: openxr::Action<openxr::Vector2f>,
+        pub right_stick: openxr::Action<openxr::Vector2f>,
+        pub left_trigger: openxr::Action<f32>,
+        pub right_trigger: openxr::Action<f32>,
+        pub south: openxr::Action<bool>,
+        pub east: openxr::Action<bool>,
+        pub west: openxr::Action<bool>,
+        pub north: openxr::Action<bool>,
+        pub menu: openxr::Action<bool>,
+        pub left_click: openxr::Action<bool>,
+        pub right_click: openxr::Action<bool>,
+        pub aim_left_space: openxr::Space,
+        pub aim_right_space: openxr::Space,
     }
 
     /// One eye's render target for a begun frame.
@@ -429,6 +520,18 @@ mod imp {
                 openxr::Posef::IDENTITY,
             ),
         )?;
+        // Controller actions (Stage 3): a failure here only costs
+        // input, so it is logged, not fatal.
+        let actions = match create_actions(&xr_instance, &session) {
+            Ok(actions) => {
+                log::info!("XR_BOOT: controller actions ready");
+                Some(actions)
+            }
+            Err(error) => {
+                log::warn!("XR_BOOT: controller actions unavailable: {error}");
+                None
+            }
+        };
         let view_config = stage(
             "view configuration",
             xr_instance.enumerate_view_configuration_views(
@@ -528,6 +631,8 @@ mod imp {
             begun: false,
             state: openxr::SessionState::UNKNOWN,
             textures,
+            actions,
+            input_warned: false,
         });
         Ok(Boot {
             instance: wgpu_instance,
@@ -562,7 +667,209 @@ mod imp {
         ))
     }
 
+    /// Build the Touch-controller action set, suggest its bindings
+    /// for the Oculus Touch profile and attach it to the session
+    /// (Stage 3 input). One action per hand and control, no subaction
+    /// paths: each binding names its hand's path directly.
+    fn create_actions(
+        instance: &openxr::Instance,
+        session: &openxr::Session<XrVulkan>,
+    ) -> StageResult<XrActions> {
+        let set = stage(
+            "action set",
+            instance.create_action_set("gameplay", "Gameplay", 0),
+        )?;
+        let left_stick = stage(
+            "action",
+            set.create_action::<openxr::Vector2f>("left_stick", "Left stick", &[]),
+        )?;
+        let right_stick = stage(
+            "action",
+            set.create_action::<openxr::Vector2f>("right_stick", "Right stick", &[]),
+        )?;
+        let left_trigger = stage(
+            "action",
+            set.create_action::<f32>("left_trigger", "Left trigger", &[]),
+        )?;
+        let right_trigger = stage(
+            "action",
+            set.create_action::<f32>("right_trigger", "Right trigger", &[]),
+        )?;
+        let south = stage("action", set.create_action::<bool>("south", "A", &[]))?;
+        let east = stage("action", set.create_action::<bool>("east", "B", &[]))?;
+        let west = stage("action", set.create_action::<bool>("west", "X", &[]))?;
+        let north = stage("action", set.create_action::<bool>("north", "Y", &[]))?;
+        let menu = stage("action", set.create_action::<bool>("menu", "Menu", &[]))?;
+        let left_click = stage(
+            "action",
+            set.create_action::<bool>("left_click", "Left stick click", &[]),
+        )?;
+        let right_click = stage(
+            "action",
+            set.create_action::<bool>("right_click", "Right stick click", &[]),
+        )?;
+        let aim_left = stage(
+            "action",
+            set.create_action::<openxr::Posef>("aim_left", "Left aim", &[]),
+        )?;
+        let aim_right = stage(
+            "action",
+            set.create_action::<openxr::Posef>("aim_right", "Right aim", &[]),
+        )?;
+        let path = |name: &str| stage("action path", instance.string_to_path(name));
+        let bindings = [
+            openxr::Binding::new(&left_stick, path("/user/hand/left/input/thumbstick")?),
+            openxr::Binding::new(&right_stick, path("/user/hand/right/input/thumbstick")?),
+            openxr::Binding::new(&left_trigger, path("/user/hand/left/input/trigger/value")?),
+            openxr::Binding::new(&right_trigger, path("/user/hand/right/input/trigger/value")?),
+            openxr::Binding::new(&south, path("/user/hand/right/input/a/click")?),
+            openxr::Binding::new(&east, path("/user/hand/right/input/b/click")?),
+            openxr::Binding::new(&west, path("/user/hand/left/input/x/click")?),
+            openxr::Binding::new(&north, path("/user/hand/left/input/y/click")?),
+            openxr::Binding::new(&menu, path("/user/hand/left/input/menu/click")?),
+            openxr::Binding::new(&left_click, path("/user/hand/left/input/thumbstick/click")?),
+            openxr::Binding::new(&right_click, path("/user/hand/right/input/thumbstick/click")?),
+            openxr::Binding::new(&aim_left, path("/user/hand/left/input/aim/pose")?),
+            openxr::Binding::new(&aim_right, path("/user/hand/right/input/aim/pose")?),
+        ];
+        stage(
+            "suggest bindings",
+            instance.suggest_interaction_profile_bindings(
+                path("/interaction_profiles/oculus/touch_controller")?,
+                &bindings,
+            ),
+        )?;
+        stage("attach actions", session.attach_action_sets(&[&set]))?;
+        let aim_left_space = stage(
+            "aim space",
+            aim_left.create_space(session, openxr::Path::NULL, openxr::Posef::IDENTITY),
+        )?;
+        let aim_right_space = stage(
+            "aim space",
+            aim_right.create_space(session, openxr::Path::NULL, openxr::Posef::IDENTITY),
+        )?;
+        Ok(XrActions {
+            set,
+            left_stick,
+            right_stick,
+            left_trigger,
+            right_trigger,
+            south,
+            east,
+            west,
+            north,
+            menu,
+            left_click,
+            right_click,
+            aim_left_space,
+            aim_right_space,
+        })
+    }
+
     impl XrContext {
+        /// Mark the published input inactive (Stage 3): the game's
+        /// polling then merges nothing, so no stale stick or button
+        /// can stay held while the session is unfocused or not
+        /// rendering.
+        fn input_inactive(&mut self) {
+            super::INPUT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .active = false;
+        }
+
+        /// Sync the controller actions and publish the snapshot the
+        /// game's pad polling reads (Stage 3). Errors are logged once;
+        /// input then simply stays inactive.
+        fn sync_input(&mut self, time: openxr::Time) {
+            let Some(actions) = &self.actions else {
+                return;
+            };
+            if let Err(error) = self
+                .session
+                .sync_actions(&[openxr::ActiveActionSet::new(&actions.set)])
+            {
+                if !self.input_warned {
+                    self.input_warned = true;
+                    log::warn!("XR_INPUT: sync failed: {error}");
+                }
+                // A stale snapshot would merge as held input forever.
+                self.input_inactive();
+                return;
+            }
+            let session = &self.session;
+            let space = &self.space;
+            let null = openxr::Path::NULL;
+            let vec2 = |action: &openxr::Action<openxr::Vector2f>| {
+                action
+                    .state(session, null)
+                    .map(|state| {
+                        if state.is_active {
+                            [state.current_state.x, state.current_state.y]
+                        } else {
+                            [0.0; 2]
+                        }
+                    })
+                    .unwrap_or([0.0; 2])
+            };
+            let analog = |action: &openxr::Action<f32>| {
+                action
+                    .state(session, null)
+                    .map(|state| if state.is_active { state.current_state } else { 0.0 })
+                    .unwrap_or(0.0)
+            };
+            let button = |action: &openxr::Action<bool>| {
+                action
+                    .state(session, null)
+                    .map(|state| state.is_active && state.current_state)
+                    .unwrap_or(false)
+            };
+            let aim = |aim_space: &openxr::Space| {
+                aim_space.locate(space, time).ok().and_then(|location| {
+                    let valid = openxr::SpaceLocationFlags::POSITION_VALID
+                        | openxr::SpaceLocationFlags::ORIENTATION_VALID;
+                    if location.location_flags.contains(valid) {
+                        let pose = location.pose;
+                        Some((
+                            [
+                                pose.orientation.x,
+                                pose.orientation.y,
+                                pose.orientation.z,
+                                pose.orientation.w,
+                            ],
+                            [pose.position.x, pose.position.y, pose.position.z],
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            };
+            let mut snapshot = super::InputSnapshot {
+                active: true,
+                left_stick: vec2(&actions.left_stick),
+                right_stick: vec2(&actions.right_stick),
+                left_trigger: analog(&actions.left_trigger),
+                right_trigger: analog(&actions.right_trigger),
+                south: button(&actions.south),
+                east: button(&actions.east),
+                west: button(&actions.west),
+                north: button(&actions.north),
+                menu: button(&actions.menu),
+                left_stick_click: button(&actions.left_click),
+                right_stick_click: button(&actions.right_click),
+                aim_left: aim(&actions.aim_left_space),
+                aim_right: aim(&actions.aim_right_space),
+                ..super::InputSnapshot::empty()
+            };
+            let mut guard = super::INPUT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // The menu fields belong to the render shim.
+            snapshot.menu_uv = guard.menu_uv;
+            snapshot.menu_trigger = guard.menu_trigger;
+            *guard = snapshot;
+        }
+
         /// Drain pending session events, beginning the session when the
         /// runtime offers it. Returns whether the session is begun.
         pub fn poll_events(&mut self) -> StageResult<bool> {
@@ -632,6 +939,7 @@ mod imp {
                 menu_layer: None,
             };
             if !self.poll_events()? {
+                self.input_inactive();
                 return Ok(skip);
             }
             let frame_state = stage("wait frame", self.frame_waiter.wait())?;
@@ -642,6 +950,7 @@ mod imp {
             };
             frame.display_time = frame_state.predicted_display_time;
             if !frame_state.should_render {
+                self.input_inactive();
                 return Ok(frame);
             }
             let (flags, views) = stage(
@@ -659,6 +968,7 @@ mod imp {
             }
             frame.should_render = true;
             frame.located_views = views.clone();
+            self.sync_input(frame_state.predicted_display_time);
             if want_menu {
                 // Menu frames acquire the menu image AND both eye
                 // images: the eyes carry a cleared projection layer
