@@ -65,6 +65,12 @@ pub(super) struct Pads {
     /// make the pad the active input, so menus stay pointer-driven.
     touch: PadState,
     touch_taps: Vec<Button>,
+    /// A live XR session published controller input this poll
+    /// (Stage 3): the controllers merge like another pad and
+    /// replace the touch controls.
+    pub(super) xr_active: bool,
+    /// The XR menu aim trigger at the last poll, for click edges.
+    pub(super) xr_menu_trigger: f32,
     pub(super) edges: Edges,
     activity: gamepad::Activity,
     context: Option<Context>,
@@ -279,6 +285,41 @@ mod hardware {
     }
 }
 
+/// The XR controllers as a pad state (Stage 3): the snapshot's
+/// face buttons by position (A south, B east, X west, Y north),
+/// the left menu button as Start.
+#[cfg(target_os = "android")]
+fn xr_pad_state(snapshot: &horizon_client_render::gfx::xr_boot::InputSnapshot) -> PadState {
+    let mut state = PadState {
+        left: snapshot.left_stick,
+        right: snapshot.right_stick,
+        triggers: [snapshot.left_trigger, snapshot.right_trigger],
+        ..PadState::default()
+    };
+    if snapshot.south {
+        state.set(Button::South, true);
+    }
+    if snapshot.east {
+        state.set(Button::East, true);
+    }
+    if snapshot.west {
+        state.set(Button::West, true);
+    }
+    if snapshot.north {
+        state.set(Button::North, true);
+    }
+    if snapshot.menu {
+        state.set(Button::Start, true);
+    }
+    if snapshot.left_stick_click {
+        state.set(Button::LeftStick, true);
+    }
+    if snapshot.right_stick_click {
+        state.set(Button::RightStick, true);
+    }
+    state
+}
+
 impl Pads {
     /// The digital buttons the person's pad changed since the last poll.
     pub(super) fn hardware_edges(&mut self, hardware: PadState) -> Vec<(Button, bool)> {
@@ -476,6 +517,16 @@ impl Game<'_> {
             hardware.merge(&keypad)
         };
         let mut state = hardware.merge(&self.pad.injected);
+        // The XR controllers (Stage 3) merge like another pad,
+        // early enough that their activity counts as pad use.
+        #[cfg(target_os = "android")]
+        {
+            let xr = horizon_client_render::gfx::xr_boot::input_snapshot();
+            self.pad.xr_active = xr.is_some();
+            if let Some(snapshot) = xr {
+                state = state.merge(&xr_pad_state(&snapshot));
+            }
+        }
         let activity = self.pad.activity.observe(&state, &self.settings.controller);
         for (i, (stick, deadzone)) in [
             (&mut state.left, self.settings.controller.move_deadzone),
@@ -501,7 +552,12 @@ impl Game<'_> {
             self.pad.in_use = self.input_mode == InputMode::Pad;
             self.pad.keyboard_took_over = false;
         }
-        let state = state.merge(&self.pad.touch);
+        // A live XR session replaces the touch controls.
+        let state = if self.pad.xr_active {
+            state
+        } else {
+            state.merge(&self.pad.touch)
+        };
         for button in std::mem::take(&mut self.pad.touch_taps) {
             self.pad.touch.set(button, false);
         }
@@ -556,6 +612,8 @@ impl Game<'_> {
             }
         }
         self.pad_menu_frame(event_loop);
+        #[cfg(target_os = "android")]
+        self.xr_menu_pointer(event_loop);
         #[cfg(target_os = "android")]
         self.mobile_pad_end(state.triggers == [0.; 2] && self.pad.late_releases.is_empty());
     }
@@ -876,7 +934,7 @@ impl Game<'_> {
         {
             return None;
         }
-        let stick = if settings.enabled {
+        let stick = if settings.enabled || self.pad.xr_active {
             self.pad.state.left
         } else {
             self.pad.touch.left
@@ -895,7 +953,7 @@ impl Game<'_> {
     /// The right stick turns the view, once per frame (`Entity.turn`).
     pub(super) fn pad_look(&mut self, seconds: f32) {
         let settings = &self.settings.controller;
-        if !settings.enabled
+        if !(settings.enabled || self.pad.xr_active)
             || self.pad_in_menu()
             || self.player.is_none()
             || !self.pad_focused()
