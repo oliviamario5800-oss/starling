@@ -438,7 +438,8 @@ mod imp {
                 session.create_swapchain(&openxr::SwapchainCreateInfo {
                     create_flags: openxr::SwapchainCreateFlags::EMPTY,
                     usage_flags: openxr::SwapchainUsageFlags::COLOR_ATTACHMENT
-                        | openxr::SwapchainUsageFlags::TRANSFER_DST,
+                        | openxr::SwapchainUsageFlags::TRANSFER_DST
+                        | openxr::SwapchainUsageFlags::TRANSFER_SRC,
                     format,
                     sample_count: 1,
                     width: view.recommended_image_rect_width,
@@ -720,7 +721,9 @@ mod imp {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUses::COLOR_TARGET,
+            usage: wgpu::TextureUses::COLOR_TARGET
+                | wgpu::TextureUses::COPY_SRC
+                | wgpu::TextureUses::COPY_DST,
             memory_flags: wgpu::hal::MemoryFlags::empty(),
             view_formats: view_formats.clone(),
         };
@@ -747,7 +750,9 @@ mod imp {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
                     view_formats: &view_formats,
                 },
                 wgpu::TextureUses::UNINITIALIZED,
