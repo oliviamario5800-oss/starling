@@ -71,6 +71,11 @@ pub(super) struct Pads {
     pub(super) xr_active: bool,
     /// The XR menu aim trigger at the last poll, for click edges.
     pub(super) xr_menu_trigger: f32,
+    /// The activity window was hidden for VR (restore it when XR ends).
+    pub(super) xr_window_hidden: bool,
+    /// Consecutive polls with no XR snapshot, to debounce the restore:
+    /// a transient input drop must not flap the window's visibility.
+    pub(super) xr_inactive_polls: u32,
     pub(super) edges: Edges,
     activity: gamepad::Activity,
     context: Option<Context>,
@@ -539,6 +544,25 @@ impl Game<'_> {
                     );
                 }
                 state = state.merge(&xr_state);
+            }
+            // The floating 2D panel: hide the activity window while XR
+            // presents. The restore is debounced (600 inactive polls):
+            // a transient snapshot drop must not flap the visibility.
+            if self.pad.xr_active {
+                self.pad.xr_inactive_polls = 0;
+                if !self.pad.xr_window_hidden {
+                    self.pad.xr_window_hidden = true;
+                    log::info!("XR_PAD: hiding the activity window for VR");
+                    crate::platform::set_game_window_visible(false);
+                }
+            } else if self.pad.xr_window_hidden {
+                self.pad.xr_inactive_polls += 1;
+                if self.pad.xr_inactive_polls >= 600 {
+                    self.pad.xr_window_hidden = false;
+                    self.pad.xr_inactive_polls = 0;
+                    log::info!("XR_PAD: restoring the activity window");
+                    crate::platform::set_game_window_visible(true);
+                }
             }
         }
         let activity = self.pad.activity.observe(&state, &self.settings.controller);
